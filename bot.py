@@ -9,11 +9,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROXY_URL = "http://proxy.server:3128"
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Put it into .env as BOT_TOKEN=...")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, proxy=PROXY_URL)
 dp = Dispatcher(bot)
 
 DR0CH_RESPONSES = [

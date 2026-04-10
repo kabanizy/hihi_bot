@@ -1,6 +1,7 @@
 """
 Telegram-бот: реакции на фразы в группе, ежедневный опрос и сводка по голосам.
 """
+import asyncio
 import html
 import json
 import os
@@ -216,17 +217,62 @@ async def group_text_handler(message: types.Message) -> None:
     await message.reply(phrase)
 
 
+async def _retry_telegram_job(job_name: str, coro_fn) -> None:
+    """Повторяет асинхронную операцию с Telegram при сетевых сбоях и лимитах API."""
+    delay_sec = 60
+    max_delay_sec = 900
+    attempt = 0
+    while True:
+        try:
+            await coro_fn()
+            return
+        except exceptions.RetryAfter as e:
+            wait = max(int(e.timeout), 1)
+            attempt += 1
+            logger.warning(
+                "%s: флуд-лимит Telegram, ждём %s с (попытка %s)",
+                job_name,
+                wait,
+                attempt,
+            )
+            await asyncio.sleep(wait)
+        except exceptions.NetworkError as e:
+            attempt += 1
+            logger.warning(
+                "%s: сеть/прокси недоступна (%s). Повтор через %s с (попытка %s)",
+                job_name,
+                e,
+                delay_sec,
+                attempt,
+            )
+            await asyncio.sleep(delay_sec)
+            delay_sec = min(int(delay_sec * 1.5), max_delay_sec)
+        except Exception:
+            attempt += 1
+            logger.exception(
+                "%s: ошибка при отправке. Повтор через %s с (попытка %s)",
+                job_name,
+                delay_sec,
+                attempt,
+            )
+            await asyncio.sleep(delay_sec)
+            delay_sec = min(int(delay_sec * 1.5), max_delay_sec)
+
+
 async def send_night_poll() -> None:
-    """По расписанию (23:00): сброс голосов и новый неанонимный опрос в GROUP_ID."""
-    if os.path.isfile(CURRENT_POLL_PATH):
-        os.remove(CURRENT_POLL_PATH)
-    poll_results.clear()
-    await bot.send_poll(
-        GROUP_ID,
-        NIGHT_POLL_QUESTION,
-        NIGHT_POLL_OPTIONS,
-        is_anonymous=False,  # чтобы приходили poll_answer и был виден выбор в опросе
-    )
+    """По расписанию: новый опрос; файл и голоса сбрасываются только после успешной отправки."""
+    async def _send() -> None:
+        await bot.send_poll(
+            GROUP_ID,
+            NIGHT_POLL_QUESTION,
+            NIGHT_POLL_OPTIONS,
+            is_anonymous=False,  # чтобы приходили poll_answer и был виден выбор в опросе
+        )
+        if os.path.isfile(CURRENT_POLL_PATH):
+            os.remove(CURRENT_POLL_PATH)
+        poll_results.clear()
+
+    await _retry_telegram_job("send_night_poll", _send)
 
 
 async def summarize_poll() -> None:
@@ -257,7 +303,7 @@ async def summarize_poll() -> None:
 
     if bad:
         parts.append(
-            "🤡 <b>Позорники</b> в списке: "
+            "🤡 <b>Позорники</b>: "
             + ", ".join(bad)
             + "\n\n"
             "Стыдно даже читать. Завтра без отговорок — включите режим сдержанности 🫵😤\n\n"
@@ -265,7 +311,7 @@ async def summarize_poll() -> None:
 
     if silent_users:
         parts.append(
-            "🐭 <b>Молчуны</b> (есть в базе, но голоса как у трусов): "
+            "🐭 <b>Нетакуси в суперпозиции мастурбации</b> aka опущенные: "
             + ", ".join(silent_users)
             + "\n\n"
             "Позорная компания: в чате базарят, а перед опросом — в норку. "
@@ -277,7 +323,11 @@ async def summarize_poll() -> None:
         )
 
     text = "".join(parts).rstrip()
-    await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+
+    async def _send() -> None:
+        await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+
+    await _retry_telegram_job("summarize_poll", _send)
 
 
 @dp.poll_answer_handler()
@@ -299,15 +349,21 @@ async def poll_answer_handler(poll_answer: types.PollAnswer) -> None:
 # Время в timezone планировщика (Europe/Moscow)
 scheduler.add_job(
     send_night_poll,
-    CronTrigger(hour=23, minute=0),
+    CronTrigger(hour=20, minute=0),
     id="send_night_poll",
     replace_existing=True,
+    max_instances=1,
+    coalesce=True,
+    misfire_grace_time=3600,
 )
 scheduler.add_job(
     summarize_poll,
-    CronTrigger(hour=0, minute=0),
+    CronTrigger(hour=21, minute=0),
     id="summarize_poll",
     replace_existing=True,
+    max_instances=1,
+    coalesce=True,
+    misfire_grace_time=3600,
 )
 
 

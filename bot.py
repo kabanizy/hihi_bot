@@ -4,6 +4,8 @@ import time
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 
@@ -17,6 +19,17 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN, proxy=PROXY_URL)
 dp = Dispatcher(bot)
+
+GROUP_ID = int(os.getenv("GROUP_ID", "-1000000000000"))
+poll_results = {}
+
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+
+NIGHT_POLL_QUESTION = "Кто сегодня дрочил сука"
+NIGHT_POLL_OPTIONS = [
+    "я сегодня был хорошим мальчиком и не дрочил :)",
+    "я снова опозорился и подрочил, но с каким кайфом(",
+]
 
 DR0CH_RESPONSES = [
     "Ого, {user}!!! Да ты в ударе! 💪😄",
@@ -116,7 +129,77 @@ async def group_text_handler(message: types.Message) -> None:
     await message.reply(phrase)
 
 
+async def send_night_poll() -> None:
+    poll_results.clear()
+    await bot.send_poll(
+        GROUP_ID,
+        NIGHT_POLL_QUESTION,
+        NIGHT_POLL_OPTIONS,
+        is_anonymous=False,
+    )
+
+
+async def summarize_poll() -> None:
+    if not poll_results:
+        return
+
+    good = [row["mention"] for row in poll_results.values() if row["option_index"] == 0]
+    bad = [row["mention"] for row in poll_results.values() if row["option_index"] == 1]
+
+    if not good and not bad:
+        return
+
+    parts = ["<b>Итог ночного опроса</b>\n"]
+
+    if good:
+        parts.append(
+            "😇 <b>Хорошими мальчиками</b> сегодня были: "
+            + ", ".join(good)
+            + "\n\n"
+            "Уважение: вы держите слово и не подводите. Так держать — вы настоящие 💪✨\n\n"
+        )
+
+    if bad:
+        parts.append(
+            "🤡 <b>Позорники</b> в списке: "
+            + ", ".join(bad)
+            + "\n\n"
+            "Стыдно даже читать. Завтра без отговорок — включите режим сдержанности 🫵😤"
+        )
+
+    text = "".join(parts).rstrip()
+    await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+
+
+@dp.poll_answer_handler()
+async def poll_answer_handler(poll_answer: types.PollAnswer) -> None:
+    if not poll_answer.option_ids:
+        return
+    uid = poll_answer.user.id
+    mention = poll_answer.user.get_mention(as_html=True)
+    option_index = poll_answer.option_ids[0]
+    poll_results[uid] = {
+        "mention": mention,
+        "option_index": option_index,
+    }
+
+
+scheduler.add_job(
+    send_night_poll,
+    CronTrigger(hour=23, minute=0),
+    id="send_night_poll",
+    replace_existing=True,
+)
+scheduler.add_job(
+    summarize_poll,
+    CronTrigger(hour=0, minute=0),
+    id="summarize_poll",
+    replace_existing=True,
+)
+
+
 if __name__ == "__main__":
+    scheduler.start()
     while True:
         try:
             executor.start_polling(dp, skip_updates=True)

@@ -1,3 +1,6 @@
+"""
+Telegram-бот: реакции на фразы в группе, ежедневный опрос и сводка по голосам.
+"""
 import os
 import random
 import time
@@ -11,6 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# HTTP(S)-прокси для запросов к api.telegram.org (при необходимости смените или уберите proxy= у Bot)
 PROXY_URL = "http://proxy.server:3128"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -20,9 +24,12 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN, proxy=PROXY_URL)
 dp = Dispatcher(bot)
 
+# Целевая супергруппа: опросы и итоги уходят сюда (задаётся в .env как GROUP_ID)
 GROUP_ID = int(os.getenv("GROUP_ID", "-1000000000000"))
+# Голоса за текущий опрос: user_id -> {mention (HTML), option_index}
 poll_results = {}
 
+# Cron-задачи в часовом поясе Москвы; start() вызывается из on_startup (нужен уже запущенный asyncio-цикл)
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 NIGHT_POLL_QUESTION = "Кто сегодня дрочил сука"
@@ -31,6 +38,7 @@ NIGHT_POLL_OPTIONS = [
     "я снова опозорился и подрочил, но с каким кайфом(",
 ]
 
+# Случайный ответ на сообщения с подстрокой «не дрочу» в группе; {user} подставляется в шаблон
 DR0CH_RESPONSES = [
     "Ого, {user}!!! Да ты в ударе! 💪😄",
     "{user}, красавчик! Так держать! 🔥😎",
@@ -79,6 +87,7 @@ DR0CH_RESPONSES = [
 
 @dp.message_handler(commands=["start"])
 async def start_handler(message: types.Message) -> None:
+    """Справка по настройке бота (в т.ч. Group Privacy в BotFather)."""
     await message.answer(
         "Бот запущен и готов к работе в группах.\n\n"
         "Если в группе нет реакции на «не дрочу»: откройте @BotFather → ваш бот → "
@@ -91,8 +100,10 @@ async def start_handler(message: types.Message) -> None:
     content_types=types.ContentType.TEXT,
 )
 async def group_text_handler(message: types.Message) -> None:
+    """Текст в группах: «бот, статус» (только админы) и триггер «не дрочу»."""
     text = (message.text or "").lower()
 
+    # Запрос статуса — только группа/супергруппа и только админ/создатель
     if "бот, статус" in text:
         if message.chat.type == types.ChatType.PRIVATE:
             await message.reply("Я работаю только в группах")
@@ -111,6 +122,7 @@ async def group_text_handler(message: types.Message) -> None:
             await message.reply("У вас нет прав для проверки статуса")
         return
 
+    # Похвала по фразе «не дрочу» — только группа, не личка
     if "не дрочу" not in text:
         return
 
@@ -130,19 +142,22 @@ async def group_text_handler(message: types.Message) -> None:
 
 
 async def send_night_poll() -> None:
+    """По расписанию (23:00): сброс голосов и новый неанонимный опрос в GROUP_ID."""
     poll_results.clear()
     await bot.send_poll(
         GROUP_ID,
         NIGHT_POLL_QUESTION,
         NIGHT_POLL_OPTIONS,
-        is_anonymous=False,
+        is_anonymous=False,  # чтобы приходили poll_answer и был виден выбор в опросе
     )
 
 
 async def summarize_poll() -> None:
+    """По расписанию (00:00): итог по накопленным голосам, HTML-упоминания в GROUP_ID."""
     if not poll_results:
         return
 
+    # Индексы совпадают с NIGHT_POLL_OPTIONS: 0 — «хороший», 1 — «позорник»
     good = [row["mention"] for row in poll_results.values() if row["option_index"] == 0]
     bad = [row["mention"] for row in poll_results.values() if row["option_index"] == 1]
 
@@ -173,6 +188,7 @@ async def summarize_poll() -> None:
 
 @dp.poll_answer_handler()
 async def poll_answer_handler(poll_answer: types.PollAnswer) -> None:
+    # Только для неанонимных опросов; при смене голоса запись по user_id перезаписывается
     if not poll_answer.option_ids:
         return
     uid = poll_answer.user.id
@@ -184,6 +200,7 @@ async def poll_answer_handler(poll_answer: types.PollAnswer) -> None:
     }
 
 
+# Время в timezone планировщика (Europe/Moscow)
 scheduler.add_job(
     send_night_poll,
     CronTrigger(hour=23, minute=0),
@@ -198,11 +215,21 @@ scheduler.add_job(
 )
 
 
+async def _scheduler_startup(_dispatcher: Dispatcher) -> None:
+    # AsyncIOScheduler требует уже работающий event loop — стартуем после входа в polling
+    if not scheduler.running:
+        scheduler.start()
+
+
 if __name__ == "__main__":
-    scheduler.start()
+    # Повтор при падении long polling (сеть, Telegram и т.д.)
     while True:
         try:
-            executor.start_polling(dp, skip_updates=True)
+            executor.start_polling(
+                dp,
+                skip_updates=True,
+                on_startup=_scheduler_startup,
+            )
         except KeyboardInterrupt:
             raise
         except Exception as e:

@@ -1,8 +1,11 @@
 """
 Telegram-бот: реакции на фразы в группе, ежедневный опрос и сводка по голосам.
 """
+import html
+import json
 import os
 import random
+import sqlite3
 import time
 import logging
 
@@ -13,11 +16,59 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
+# workon my_bot_env
+# pip install -r requirements.txt
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQLite: участники, которые писали в группах (для рассылок и админ-команд)
+# ---------------------------------------------------------------------------
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_BASE_DIR, "active_users.db")
+CURRENT_POLL_PATH = os.path.join(_BASE_DIR, "current_poll.json")
+
+
+def init_db() -> None:
+    """Создаёт таблицу active_users при старте бота (если её ещё нет)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_users (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_user(user_id: int, name: str) -> None:
+    """Добавляет пользователя или обновляет full_name (INSERT OR REPLACE)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO active_users (user_id, full_name) VALUES (?, ?)",
+            (user_id, name),
+        )
+        conn.commit()
+
+
+def get_all_users() -> dict[int, str]:
+    """Все user_id → full_name из таблицы."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT user_id, full_name FROM active_users").fetchall()
+    return {int(r[0]): (r[1] or "") for r in rows}
+
+
+def clear_all_users() -> None:
+    """Полностью очищает таблицу (для админ-команды)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM active_users")
+        conn.commit()
+
 
 # HTTP(S)-прокси для запросов к api.telegram.org (при необходимости смените или уберите proxy= у Bot)
 PROXY_URL = "http://proxy.server:3128"
@@ -31,6 +82,12 @@ dp = Dispatcher(bot)
 
 # Целевая супергруппа: опросы и итоги уходят сюда (задаётся в .env как GROUP_ID)
 GROUP_ID = int(os.getenv("GROUP_ID", "-1000000000000"))
+
+_admin_env = (os.getenv("ADMIN_ID") or "").strip()
+try:
+    ADMIN_ID = int(_admin_env) if _admin_env else None
+except ValueError:
+    ADMIN_ID = None
 # Голоса за текущий опрос: user_id -> {mention (HTML), option_index}
 poll_results = {}
 
@@ -90,6 +147,16 @@ DR0CH_RESPONSES = [
 ]
 
 
+@dp.message_handler(commands=["clear_users"])
+async def clear_users_handler(message: types.Message) -> None:
+    """Очистка таблицы участников (только ADMIN_ID из .env)."""
+    if ADMIN_ID is None or message.from_user.id != ADMIN_ID:
+        await message.reply("Нет доступа.")
+        return
+    clear_all_users()
+    await message.answer("База участников очищена")
+
+
 @dp.message_handler(commands=["start"])
 async def start_handler(message: types.Message) -> None:
     """Справка по настройке бота (в т.ч. Group Privacy в BotFather)."""
@@ -106,6 +173,9 @@ async def start_handler(message: types.Message) -> None:
 )
 async def group_text_handler(message: types.Message) -> None:
     """Текст в группах: «бот, статус» (только админы) и триггер «не дрочу»."""
+    if message.from_user:
+        save_user(message.from_user.id, message.from_user.full_name or "")
+
     text = (message.text or "").lower()
 
     # Запрос статуса — только группа/супергруппа и только админ/создатель
@@ -148,6 +218,8 @@ async def group_text_handler(message: types.Message) -> None:
 
 async def send_night_poll() -> None:
     """По расписанию (23:00): сброс голосов и новый неанонимный опрос в GROUP_ID."""
+    if os.path.isfile(CURRENT_POLL_PATH):
+        os.remove(CURRENT_POLL_PATH)
     poll_results.clear()
     await bot.send_poll(
         GROUP_ID,
@@ -159,17 +231,21 @@ async def send_night_poll() -> None:
 
 async def summarize_poll() -> None:
     """По расписанию (00:00): итог по накопленным голосам, HTML-упоминания в GROUP_ID."""
-    if not poll_results:
+    all_users = get_all_users()
+    if not poll_results and not all_users:
         return
 
     # Индексы совпадают с NIGHT_POLL_OPTIONS: 0 — «хороший», 1 — «позорник»
     good = [row["mention"] for row in poll_results.values() if row["option_index"] == 0]
     bad = [row["mention"] for row in poll_results.values() if row["option_index"] == 1]
 
-    if not good and not bad:
-        return
+    silent_uids = [uid for uid in all_users if uid not in poll_results]
+    silent_users = [
+        f'<a href="tg://user?id={uid}">{html.escape(all_users[uid] or "без имени")}</a>'
+        for uid in silent_uids
+    ]
 
-    parts = ["<b>Итог ночного опроса</b>\n"]
+    parts = ["<b>Итог ночного опроса</b>\n\n"]
 
     if good:
         parts.append(
@@ -184,7 +260,20 @@ async def summarize_poll() -> None:
             "🤡 <b>Позорники</b> в списке: "
             + ", ".join(bad)
             + "\n\n"
-            "Стыдно даже читать. Завтра без отговорок — включите режим сдержанности 🫵😤"
+            "Стыдно даже читать. Завтра без отговорок — включите режим сдержанности 🫵😤\n\n"
+        )
+
+    if silent_users:
+        parts.append(
+            "🐭 <b>Молчуны</b> (есть в базе, но голоса как у трусов): "
+            + ", ".join(silent_users)
+            + "\n\n"
+            "Позорная компания: в чате базарят, а перед опросом — в норку. "
+            "Завтра без отмазок, иначе вы просто слабаки 🫵😤"
+        )
+    else:
+        parts.append(
+            "Сегодня в этом чате все были искренними — в базе никто не прятался от опроса. ✨"
         )
 
     text = "".join(parts).rstrip()
@@ -203,6 +292,8 @@ async def poll_answer_handler(poll_answer: types.PollAnswer) -> None:
         "mention": mention,
         "option_index": option_index,
     }
+    with open(CURRENT_POLL_PATH, "w", encoding="utf-8") as f:
+        json.dump(poll_results, f, ensure_ascii=False, indent=2)
 
 
 # Время в timezone планировщика (Europe/Moscow)
@@ -221,12 +312,23 @@ scheduler.add_job(
 
 
 async def _scheduler_startup(_dispatcher: Dispatcher) -> None:
+    init_db()
     # AsyncIOScheduler требует уже работающий event loop — стартуем после входа в polling
     if not scheduler.running:
         scheduler.start()
 
 
 if __name__ == "__main__":
+    if os.path.isfile(CURRENT_POLL_PATH):
+        with open(CURRENT_POLL_PATH, encoding="utf-8") as f:
+            loaded = json.load(f)
+        poll_results.clear()
+        for key, row in loaded.items():
+            poll_results[int(key)] = {
+                "mention": row["mention"],
+                "option_index": int(row["option_index"]),
+            }
+
     # Повтор при падении long polling (сеть, Telegram и т.д.)
     while True:
         try:
